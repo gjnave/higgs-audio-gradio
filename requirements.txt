@@ -17,3 +17,5 @@ langid
 jieba
 accelerate>=0.26.0
 bitsandbytes
+gradio
+openai-whisper
