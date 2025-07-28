@@ -29,7 +29,7 @@ preloaded_voices = [f.split('.')[0] for f in os.listdir(voice_prompts_dir) if f.
 
 
 # Audio generation function
-def generate_audio(scene_description, transcript, voice_type, ref_audio_dropdown, custom_audio_upload, temperature, seed, speaker0, speaker1):
+def generate_audio(scene_description, transcript, voice_type, ref_audio_dropdown, custom_audio_upload, temperature, seed, speaker0, speaker0_custom_audio_upload, speaker1, speaker1_custom_audio_upload):
     # Detect if transcript is multi-speaker
     is_multi_speaker = "[SPEAKER" in transcript
     if is_multi_speaker and voice_type == "Voice Clone":
@@ -71,19 +71,37 @@ def generate_audio(scene_description, transcript, voice_type, ref_audio_dropdown
             return "Please select two speakers for multi-voice cloning."
 
         # Get the reference audio and transcript for each speaker
-        ref_audio_path_0 = os.path.join(voice_prompts_dir, f"{speaker0}.wav")
-        ref_transcript_path_0 = os.path.join(voice_prompts_dir, f"{speaker0}.txt")
-        if not os.path.exists(ref_transcript_path_0):
-            return f"Reference transcript not found for {speaker0}"
-        with open(ref_transcript_path_0, encoding="utf-8") as f:
-            ref_transcript_0 = f.read().strip()
+        ref_audio_path_0 = ""
+        ref_transcript_0 = ""
+        if speaker0 == "Custom Upload":
+            if speaker0_custom_audio_upload is None:
+                return "Please upload a custom audio file for Speaker 0 (WAV format)."
+            ref_audio_path_0 = speaker0_custom_audio_upload
+            result = whisper_model.transcribe(ref_audio_path_0)
+            ref_transcript_0 = result["text"]
+        else:
+            ref_audio_path_0 = os.path.join(voice_prompts_dir, f"{speaker0}.wav")
+            ref_transcript_path_0 = os.path.join(voice_prompts_dir, f"{speaker0}.txt")
+            if not os.path.exists(ref_transcript_path_0):
+                return f"Reference transcript not found for {speaker0}"
+            with open(ref_transcript_path_0, encoding="utf-8") as f:
+                ref_transcript_0 = f.read().strip()
 
-        ref_audio_path_1 = os.path.join(voice_prompts_dir, f"{speaker1}.wav")
-        ref_transcript_path_1 = os.path.join(voice_prompts_dir, f"{speaker1}.txt")
-        if not os.path.exists(ref_transcript_path_1):
-            return f"Reference transcript not found for {speaker1}"
-        with open(ref_transcript_path_1, encoding="utf-8") as f:
-            ref_transcript_1 = f.read().strip()
+        ref_audio_path_1 = ""
+        ref_transcript_1 = ""
+        if speaker1 == "Custom Upload":
+            if speaker1_custom_audio_upload is None:
+                return "Please upload a custom audio file for Speaker 1 (WAV format)."
+            ref_audio_path_1 = speaker1_custom_audio_upload
+            result = whisper_model.transcribe(ref_audio_path_1)
+            ref_transcript_1 = result["text"]
+        else:
+            ref_audio_path_1 = os.path.join(voice_prompts_dir, f"{speaker1}.wav")
+            ref_transcript_path_1 = os.path.join(voice_prompts_dir, f"{speaker1}.txt")
+            if not os.path.exists(ref_transcript_path_1):
+                return f"Reference transcript not found for {speaker1}"
+            with open(ref_transcript_path_1, encoding="utf-8") as f:
+                ref_transcript_1 = f.read().strip()
 
         # Construct the message sequence to teach the model the voices
         messages.extend([
@@ -166,16 +184,26 @@ with gr.Blocks(theme=gr.themes.Soft()) as app:  # Dark theme replacement
                 )
             with gr.Group(visible=False) as multi_voice_clone_group:
                 speaker0_dropdown = gr.Dropdown(
-                    choices=["None"] + preloaded_voices,
+                    choices=["None"] + preloaded_voices + ["Custom Upload"],
                     label="Speaker 0",
                     value="belinda",
-                    info="Select the voice for [SPEAKER0]."
+                    info="Select a pre-loaded voice or upload your own for [SPEAKER0]."
+                )
+                speaker0_custom_audio_upload = gr.File(
+                    label="Custom Reference Audio for Speaker 0 (Upload a WAV file if 'Custom Upload' is selected)",
+                    file_types=[".wav"],
+                    visible=False
                 )
                 speaker1_dropdown = gr.Dropdown(
-                    choices=["None"] + preloaded_voices,
+                    choices=["None"] + preloaded_voices + ["Custom Upload"],
                     label="Speaker 1",
                     value="broom_salesman",
-                    info="Select the voice for [SPEAKER1]."
+                    info="Select a pre-loaded voice or upload your own for [SPEAKER1]."
+                )
+                speaker1_custom_audio_upload = gr.File(
+                    label="Custom Reference Audio for Speaker 1 (Upload a WAV file if 'Custom Upload' is selected)",
+                    file_types=[".wav"],
+                    visible=False
                 )
             temperature = gr.Slider(
                 minimum=0.1,
@@ -199,9 +227,21 @@ with gr.Blocks(theme=gr.themes.Soft()) as app:  # Dark theme replacement
                         inputs=voice_type,
                         outputs=[voice_clone_group, multi_voice_clone_group])
 
+    ref_audio_dropdown.change(fn=lambda value: gr.update(visible=value == "Custom Upload"),
+                               inputs=ref_audio_dropdown,
+                               outputs=custom_audio_upload)
+
+    speaker0_dropdown.change(fn=lambda value: gr.update(visible=value == "Custom Upload"),
+                              inputs=speaker0_dropdown,
+                              outputs=speaker0_custom_audio_upload)
+
+    speaker1_dropdown.change(fn=lambda value: gr.update(visible=value == "Custom Upload"),
+                              inputs=speaker1_dropdown,
+                              outputs=speaker1_custom_audio_upload)
+
     generate_btn.click(
         fn=generate_audio,
-        inputs=[scene_description, transcript, voice_type, ref_audio_dropdown, custom_audio_upload, temperature, seed, speaker0_dropdown, speaker1_dropdown],
+        inputs=[scene_description, transcript, voice_type, ref_audio_dropdown, custom_audio_upload, temperature, seed, speaker0_dropdown, speaker0_custom_audio_upload, speaker1_dropdown, speaker1_custom_audio_upload],
         outputs=output_audio
     )
 
