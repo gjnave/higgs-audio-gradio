@@ -1,36 +1,35 @@
 import asyncio
 import base64
-import torch
-import numpy as np
-from io import BytesIO
-from dataclasses import dataclass
-from typing import List, Optional, Union
-from copy import deepcopy
-from transformers import AutoTokenizer, AutoProcessor
-from transformers.cache_utils import StaticCache
-from transformers.generation.streamers import BaseStreamer
-from transformers.generation.stopping_criteria import StoppingCriteria
-from dataclasses import asdict
-from loguru import logger
 import threading
+from copy import deepcopy
+from dataclasses import asdict, dataclass
+from io import BytesIO
+from typing import Union
+
 import librosa
+import numpy as np
+import torch
+from loguru import logger
+from transformers import AutoProcessor, AutoTokenizer
+from transformers.cache_utils import StaticCache
+from transformers.generation.stopping_criteria import StoppingCriteria
+from transformers.generation.streamers import BaseStreamer
 
-
-from ..dataset.chatml_dataset import ChatMLSample, ChatMLDatasetSample, prepare_chatml_sample
+from ..audio_processing.higgs_audio_tokenizer import load_higgs_audio_tokenizer
+from ..data_collator.higgs_audio_collator import HiggsAudioSampleCollator
+from ..dataset.chatml_dataset import ChatMLDatasetSample, ChatMLSample, prepare_chatml_sample
 from ..model.higgs_audio import HiggsAudioModel
 from ..model.higgs_audio.utils import revert_delay_pattern
-from ..data_collator.higgs_audio_collator import HiggsAudioSampleCollator
-from ..audio_processing.higgs_audio_tokenizer import load_higgs_audio_tokenizer
 
 
 @dataclass
 class HiggsAudioStreamerDelta:
     """Represents a chunk of generated content, either text or audio tokens."""
 
-    text: Optional[str] = None
-    text_tokens: Optional[torch.Tensor] = None
-    audio_tokens: Optional[torch.Tensor] = None
-    finish_reason: Optional[str] = None
+    text: str | None = None
+    text_tokens: torch.Tensor | None = None
+    audio_tokens: torch.Tensor | None = None
+    finish_reason: str | None = None
 
 
 class AsyncHiggsAudioStreamer(BaseStreamer):
@@ -77,7 +76,7 @@ class AsyncHiggsAudioStreamer(BaseStreamer):
         self,
         tokenizer: "AutoTokenizer",
         skip_prompt: bool = False,
-        timeout: Optional[float] = None,
+        timeout: float | None = None,
         audio_num_codebooks: int = 1,
         **decode_kwargs,
     ):
@@ -160,19 +159,19 @@ class AsyncStoppingCriteria(StoppingCriteria):
 
     def __call__(self, input_ids, scores, **kwargs) -> bool:
         if self.stop_signal.is_set():
-            logger.info(f"Stop signal received. Can be caused by client disconnection.")
+            logger.info("Stop signal received. Can be caused by client disconnection.")
             return True
         return False
 
 
 @dataclass
 class HiggsAudioResponse:
-    audio: Optional[np.ndarray] = None
-    generated_audio_tokens: Optional[np.ndarray] = None
-    sampling_rate: Optional[int] = None
+    audio: np.ndarray | None = None
+    generated_audio_tokens: np.ndarray | None = None
+    sampling_rate: int | None = None
     generated_text: str = ""
-    generated_text_tokens: Optional[np.ndarray] = None
-    usage: Optional[dict] = None
+    generated_text_tokens: np.ndarray | None = None
+    usage: dict | None = None
 
 
 class HiggsAudioServeEngine:
@@ -180,10 +179,12 @@ class HiggsAudioServeEngine:
         self,
         model_name_or_path: str,
         audio_tokenizer_name_or_path: str,
-        tokenizer_name_or_path: Optional[str] = None,
+        tokenizer_name_or_path: str | None = None,
         device: str = "cuda",
         torch_dtype: Union[torch.dtype, str] = "auto",
-        kv_cache_lengths: List[int] = [1024, 4096, 8192],  # Multiple KV cache sizes
+        kv_cache_lengths: list[int] = [1024, 4096, 8192],  # Multiple KV cache sizes
+        load_in_8bit: bool = False,
+        load_in_4bit: bool = False,
     ):
         """
         Initialize the HiggsAudioServeEngine, a serving wrapper for the HiggsAudioModel.
@@ -202,13 +203,25 @@ class HiggsAudioServeEngine:
                 The lengths of the KV caches to use for the model. Used for cuda graph capture when device is cuda.
             torch_dtype (Union[torch.dtype, str]):
                 The dtype to use for the model.
+            load_in_8bit (bool):
+                Whether to load the model in 8-bit using bitsandbytes.
+            load_in_4bit (bool):
+                Whether to load the model in 4-bit using bitsandbytes.
         """
         self.device = device
         self.model_name_or_path = model_name_or_path
         self.torch_dtype = torch_dtype
 
         # Initialize model and tokenizer
-        self.model = HiggsAudioModel.from_pretrained(model_name_or_path, torch_dtype=torch_dtype).to(device)
+        if load_in_8bit or load_in_4bit:
+            self.model = HiggsAudioModel.from_pretrained(
+                model_name_or_path,
+                torch_dtype=torch_dtype,
+                load_in_8bit=load_in_8bit,
+                load_in_4bit=load_in_4bit,
+            )
+        else:
+            self.model = HiggsAudioModel.from_pretrained(model_name_or_path, torch_dtype=torch_dtype).to(device)
         logger.info(f"Loaded model from {model_name_or_path}, dtype: {self.model.dtype}")
 
         if tokenizer_name_or_path is None:
@@ -216,7 +229,7 @@ class HiggsAudioServeEngine:
         logger.info(f"Loading tokenizer from {tokenizer_name_or_path}")
         self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name_or_path)
 
-        logger.info(f"Initializing Higgs Audio Tokenizer")
+        logger.info("Initializing Higgs Audio Tokenizer")
         self.audio_tokenizer = load_higgs_audio_tokenizer(audio_tokenizer_name_or_path, device=device)
 
         self.audio_num_codebooks = self.model.config.audio_num_codebooks
@@ -245,7 +258,7 @@ class HiggsAudioServeEngine:
         }
 
         if self.model.config.encode_whisper_embed:
-            logger.info(f"Loading whisper processor")
+            logger.info("Loading whisper processor")
             whisper_processor = AutoProcessor.from_pretrained(
                 "openai/whisper-large-v3-turbo",
                 trust_remote=True,
@@ -270,8 +283,8 @@ class HiggsAudioServeEngine:
         )
 
         # Capture CUDA graphs for each KV cache length
-        if device == "cuda":
-            logger.info(f"Capturing CUDA graphs for each KV cache length")
+        if device == "cuda" and not (load_in_8bit or load_in_4bit):
+            logger.info("Capturing CUDA graphs for each KV cache length")
             self.model.capture_model(self.kv_caches.values())
 
     def _prepare_inputs(self, chat_ml_sample: ChatMLSample, force_audio_gen: bool = False):
@@ -340,13 +353,13 @@ class HiggsAudioServeEngine:
         chat_ml_sample: ChatMLSample,
         max_new_tokens: int,
         temperature: float = 0.7,
-        top_k: Optional[int] = None,
+        top_k: int | None = None,
         top_p: float = 0.95,
-        stop_strings: Optional[List[str]] = None,
+        stop_strings: list[str] | None = None,
         force_audio_gen: bool = False,
-        ras_win_len: Optional[int] = 7,
+        ras_win_len: int | None = 7,
         ras_win_max_num_repeat: int = 2,
-        seed: Optional[int] = None,
+        seed: int | None = None,
     ):
         """
         Generate audio from a chatml sample.
