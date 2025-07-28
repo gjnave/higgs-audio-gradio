@@ -1,43 +1,44 @@
 """Higgs-Audio is an end-to-end multimodal model with the capability to understand and generate text / audio."""
 
-import torch
-import torch.nn as nn
-import math
-import glob
 import functools
+import glob
+import math
 import os
-from collections import defaultdict, OrderedDict
+from collections import OrderedDict, defaultdict
 from dataclasses import dataclass
 from enum import Enum
-from safetensors.torch import load_file
-from typing import Optional, Tuple, Union, List, Dict, Any
+from typing import Any, Union
 
+import torch
+import torch.nn as nn
+from safetensors.torch import load_file
 from transformers import AutoTokenizer
+from transformers.cache_utils import Cache, DynamicCache, StaticCache
+from transformers.generation import GenerationConfig, GenerationMixin, LogitsProcessorList, StoppingCriteriaList
+from transformers.generation.streamers import BaseStreamer
+from transformers.generation.utils import GenerateNonBeamOutput
+from transformers.modeling_attn_mask_utils import AttentionMaskConverter
 from transformers.modeling_outputs import BaseModelOutput
-from transformers.models.whisper.modeling_whisper import WhisperEncoderLayer
 from transformers.models.llama.modeling_llama import (
-    LlamaDecoderLayer,
-    LlamaRMSNorm,
-    LlamaRotaryEmbedding,
     LLAMA_ATTENTION_CLASSES,
+    LlamaDecoderLayer,
     LlamaMLP,
     LlamaRMSNorm,
+    LlamaRotaryEmbedding,
 )
-from transformers.modeling_attn_mask_utils import AttentionMaskConverter
-from transformers.cache_utils import Cache, DynamicCache, StaticCache
-from transformers.generation import GenerationMixin, GenerationConfig, LogitsProcessorList, StoppingCriteriaList
-from transformers.generation.utils import GenerateNonBeamOutput
-from transformers.utils import logging, ModelOutput
+from transformers.models.whisper.modeling_whisper import WhisperEncoderLayer
+from transformers.utils import ModelOutput, logging
 
-from .common import HiggsAudioPreTrainedModel
-from .utils import (
-    merge_input_ids_with_audio_features,
-    count_parameters,
-)
-from .configuration_higgs_audio import HiggsAudioConfig, HiggsAudioEncoderConfig
-from .custom_modules import PartiallyFrozenLinear, PartiallyFrozenEmbedding
-from .cuda_graph_runner import CUDAGraphRunner
 from .audio_head import HiggsAudioDecoderProjector
+from .common import HiggsAudioPreTrainedModel
+from .configuration_higgs_audio import HiggsAudioConfig, HiggsAudioEncoderConfig
+from .cuda_graph_runner import CUDAGraphRunner
+from .custom_modules import PartiallyFrozenEmbedding, PartiallyFrozenLinear
+from .utils import (
+    count_parameters,
+    merge_input_ids_with_audio_features,
+)
+
 
 logger = logging.get_logger(__name__)
 
@@ -88,7 +89,7 @@ def _whisper_encoder_zero_shape_forward(whisper_encoder, *args, **kwargs):
     if whisper_encoder.config._attn_implementation != "flash_attention_2":
         old_shape_functions = []
         for layer in whisper_encoder.layers:
-            old_shape_functions.append(getattr(layer.self_attn, "_shape"))
+            old_shape_functions.append(layer.self_attn._shape)
             layer.self_attn._shape = functools.partial(
                 _patched_shape, num_heads=layer.self_attn.num_heads, head_dim=layer.self_attn.head_dim
             )
@@ -430,18 +431,18 @@ class HiggsAudioDualFFNDecoderLayer(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        audio_attention_mask: Optional[torch.Tensor] = None,
-        fast_forward_attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        audio_out_mask: Optional[torch.BoolTensor] = None,
-        is_decoding_audio_token: Optional[bool] = None,
-        past_key_value: Optional[Cache] = None,
-        output_attentions: Optional[bool] = False,
-        use_cache: Optional[bool] = False,
-        cache_position: Optional[torch.LongTensor] = None,
-        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # will become mandatory in v4.46
-        is_using_cuda_graph: Optional[bool] = False,
+        attention_mask: torch.Tensor | None = None,
+        audio_attention_mask: torch.Tensor | None = None,
+        fast_forward_attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        audio_out_mask: torch.BoolTensor | None = None,
+        is_decoding_audio_token: bool | None = None,
+        past_key_value: Cache | None = None,
+        output_attentions: bool | None = False,
+        use_cache: bool | None = False,
+        cache_position: torch.LongTensor | None = None,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,  # will become mandatory in v4.46
+        is_using_cuda_graph: bool | None = False,
         **kwargs,
     ):
         """
@@ -730,22 +731,22 @@ class HiggsAudioDualFFNDecoderLayer(nn.Module):
 
 @dataclass
 class HiggsAudioModelOutputWithPast(ModelOutput):
-    loss: Optional[torch.FloatTensor] = None
-    llm_loss: Optional[torch.FloatTensor] = None
-    audio_loss: Optional[torch.FloatTensor] = None
-    codebook_losses: Optional[torch.FloatTensor] = None
-    logits: Optional[torch.FloatTensor] = None
-    expanded_input_ids: Optional[torch.LongTensor] = None
-    expanded_labels: Optional[torch.LongTensor] = None
-    audio_in_mask: Optional[torch.BoolTensor] = None
-    audio_in_discrete_codes_mask: Optional[torch.BoolTensor] = None
-    audio_out_mask: Optional[torch.BoolTensor] = None
-    attention_mask: Optional[torch.BoolTensor] = None
-    audio_logits: Optional[torch.FloatTensor] = None
-    past_key_values: Optional[Cache] = None
-    hidden_states: Optional[Tuple[torch.FloatTensor, ...]] = None
-    audio_hidden_states: Optional[Tuple[torch.FloatTensor, ...]] = None
-    attentions: Optional[Tuple[torch.FloatTensor, ...]] = None
+    loss: torch.FloatTensor | None = None
+    llm_loss: torch.FloatTensor | None = None
+    audio_loss: torch.FloatTensor | None = None
+    codebook_losses: torch.FloatTensor | None = None
+    logits: torch.FloatTensor | None = None
+    expanded_input_ids: torch.LongTensor | None = None
+    expanded_labels: torch.LongTensor | None = None
+    audio_in_mask: torch.BoolTensor | None = None
+    audio_in_discrete_codes_mask: torch.BoolTensor | None = None
+    audio_out_mask: torch.BoolTensor | None = None
+    attention_mask: torch.BoolTensor | None = None
+    audio_logits: torch.FloatTensor | None = None
+    past_key_values: Cache | None = None
+    hidden_states: tuple[torch.FloatTensor, ...] | None = None
+    audio_hidden_states: tuple[torch.FloatTensor, ...] | None = None
+    attentions: tuple[torch.FloatTensor, ...] | None = None
 
 
 @dataclass
@@ -783,12 +784,12 @@ class HiggsAudioGenerationOutput(ModelOutput):
     """
 
     sequences: torch.LongTensor = None
-    audio_sequences: Optional[List[torch.LongTensor]] = None
-    scores: Optional[Tuple[torch.FloatTensor]] = None
-    logits: Optional[Tuple[torch.FloatTensor]] = None
-    attentions: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
-    hidden_states: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
-    past_key_values: Optional[Tuple[Tuple[Tuple[torch.FloatTensor]]]] = None
+    audio_sequences: list[torch.LongTensor] | None = None
+    scores: tuple[torch.FloatTensor] | None = None
+    logits: tuple[torch.FloatTensor] | None = None
+    attentions: tuple[tuple[torch.FloatTensor]] | None = None
+    hidden_states: tuple[tuple[torch.FloatTensor]] | None = None
+    past_key_values: tuple[tuple[tuple[torch.FloatTensor]]] | None = None
 
 
 class HiggsAudioModel(HiggsAudioPreTrainedModel, GenerationMixin):
@@ -1082,14 +1083,14 @@ class HiggsAudioModel(HiggsAudioPreTrainedModel, GenerationMixin):
         position_ids: torch.Tensor,
         audio_discrete_codes_mask: torch.Tensor,
         cache_position: torch.Tensor,
-        past_key_values: Optional[Union[Cache, List[torch.FloatTensor]]],
+        past_key_values: Union[Cache, list[torch.FloatTensor]] | None,
         use_cache: bool,
         audio_attention_mask: torch.Tensor,
         fast_forward_attention_mask: torch.Tensor,
         output_attentions: bool,
         output_hidden_states: bool,
-        is_decoding_audio_token: Optional[bool] = None,
-        is_using_cuda_graph: Optional[bool] = False,
+        is_decoding_audio_token: bool | None = None,
+        is_using_cuda_graph: bool | None = False,
     ):
         # create position embeddings to be shared across the decoder layers
         # When past_key_values is passed in, we need to offset the position ids when calculating the position embeddings.
@@ -1141,28 +1142,28 @@ class HiggsAudioModel(HiggsAudioPreTrainedModel, GenerationMixin):
 
     def forward(
         self,
-        input_ids: Optional[torch.LongTensor] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        attention_mask: Optional[torch.BoolTensor] = None,
-        audio_features: Optional[torch.FloatTensor] = None,
-        audio_feature_attention_mask: Optional[torch.BoolTensor] = None,
-        audio_in_ids: Optional[torch.LongTensor] = None,
-        audio_in_ids_start: Optional[torch.LongTensor] = None,
-        audio_out_ids: Optional[torch.LongTensor] = None,
-        audio_out_ids_start: Optional[torch.LongTensor] = None,
-        audio_out_ids_start_group_loc: Optional[torch.LongTensor] = None,
-        label_ids: Optional[torch.LongTensor] = None,
-        label_audio_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
-        use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        output_audio_hidden_states: Optional[bool] = False,
-        return_dict: Optional[bool] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        cache_audio_discrete_codes_mask: Optional[torch.LongTensor] = None,
-        past_key_values_buckets: Optional[OrderedDict[int, Cache]] = None,
-        reward: Optional[torch.FloatTensor] = None,
+        input_ids: torch.LongTensor | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        attention_mask: torch.BoolTensor | None = None,
+        audio_features: torch.FloatTensor | None = None,
+        audio_feature_attention_mask: torch.BoolTensor | None = None,
+        audio_in_ids: torch.LongTensor | None = None,
+        audio_in_ids_start: torch.LongTensor | None = None,
+        audio_out_ids: torch.LongTensor | None = None,
+        audio_out_ids_start: torch.LongTensor | None = None,
+        audio_out_ids_start_group_loc: torch.LongTensor | None = None,
+        label_ids: torch.LongTensor | None = None,
+        label_audio_ids: torch.LongTensor | None = None,
+        past_key_values: Union[Cache, list[torch.FloatTensor]] | None = None,
+        use_cache: bool | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+        output_audio_hidden_states: bool | None = False,
+        return_dict: bool | None = None,
+        cache_position: torch.LongTensor | None = None,
+        cache_audio_discrete_codes_mask: torch.LongTensor | None = None,
+        past_key_values_buckets: OrderedDict[int, Cache] | None = None,
+        reward: torch.FloatTensor | None = None,
     ):
         """Forward pass for the Higgs-Audio model.
 
@@ -1420,11 +1421,11 @@ class HiggsAudioModel(HiggsAudioPreTrainedModel, GenerationMixin):
     def _update_model_kwargs_for_generation(
         self,
         outputs: ModelOutput,
-        model_kwargs: Dict[str, Any],
+        model_kwargs: dict[str, Any],
         is_encoder_decoder: bool = False,
         num_new_tokens: int = 1,
         extend_attention_mask: bool = True,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """Update the model kwargs for each step."""
         model_kwargs["past_key_values"] = outputs.past_key_values
 
@@ -1467,9 +1468,9 @@ class HiggsAudioModel(HiggsAudioPreTrainedModel, GenerationMixin):
     def _prepare_kv_cache(
         self,
         current_sequence_length: int,
-        current_past_key_values_bucket: Optional[int],
+        current_past_key_values_bucket: int | None,
         past_key_values_buckets: OrderedDict[int, Cache],
-    ) -> Tuple[Optional[Cache], Optional[int]]:
+    ) -> tuple[Cache | None, int | None]:
         """Prepare the KV cache for the current sequence length."""
         for cache_length in past_key_values_buckets.keys():
             if cache_length >= current_sequence_length:
@@ -1495,11 +1496,11 @@ class HiggsAudioModel(HiggsAudioPreTrainedModel, GenerationMixin):
         do_sample: bool,
         logits_processor: LogitsProcessorList,
         device: torch.device,
-        torch_generator: Optional[torch.Generator],
+        torch_generator: torch.Generator | None,
         generation_config: GenerationConfig,
         num_delay: int,
-        num_remaining_delays: Optional[int],
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, Optional[int]]:
+        num_remaining_delays: int | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, int | None]:
         """Sample audio tokens and its corresponding text tokens from the logits"""
 
         # parameters related to repetition aware sampling
@@ -1582,7 +1583,7 @@ class HiggsAudioModel(HiggsAudioPreTrainedModel, GenerationMixin):
         logits_processor: LogitsProcessorList,
         device: torch.device,
         generation_mode: GenerationMode,
-        torch_generator: Optional[torch.Generator],
+        torch_generator: torch.Generator | None,
     ) -> torch.Tensor:
         """Sample text tokens from the logits"""
         # Clone is needed to avoid keeping a hanging ref to outputs.logits which may be very large for first iteration
@@ -1628,8 +1629,8 @@ class HiggsAudioModel(HiggsAudioPreTrainedModel, GenerationMixin):
         stopping_criteria: StoppingCriteriaList,
         generation_config: GenerationConfig,
         synced_gpus: bool,
-        streamer: Optional["BaseStreamer"],
-        past_key_values_buckets: Optional[OrderedDict[int, Cache]],
+        streamer: BaseStreamer | None,
+        past_key_values_buckets: OrderedDict[int, Cache] | None,
         **model_kwargs,
     ) -> Union[GenerateNonBeamOutput, torch.LongTensor]:
         r"""
@@ -1932,18 +1933,18 @@ class HiggsAudioModel(HiggsAudioPreTrainedModel, GenerationMixin):
     @torch.inference_mode()
     def generate(
         self,
-        input_ids: Optional[torch.LongTensor] = None,
-        audio_features: Optional[torch.FloatTensor] = None,
-        audio_feature_attention_mask: Optional[torch.BoolTensor] = None,
-        audio_in_ids: Optional[torch.LongTensor] = None,
-        audio_in_ids_start: Optional[torch.LongTensor] = None,
-        audio_out_ids: Optional[torch.LongTensor] = None,
-        audio_out_ids_start: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
+        input_ids: torch.LongTensor | None = None,
+        audio_features: torch.FloatTensor | None = None,
+        audio_feature_attention_mask: torch.BoolTensor | None = None,
+        audio_in_ids: torch.LongTensor | None = None,
+        audio_in_ids_start: torch.LongTensor | None = None,
+        audio_out_ids: torch.LongTensor | None = None,
+        audio_out_ids_start: torch.LongTensor | None = None,
+        past_key_values: Union[Cache, list[torch.FloatTensor]] | None = None,
         audio_out_bos_token_id: int = None,
         audio_eos_token_id: int = None,
-        past_key_values_buckets: Optional[OrderedDict[int, Cache]] = None,
-        seed: Optional[int] = None,
+        past_key_values_buckets: OrderedDict[int, Cache] | None = None,
+        seed: int | None = None,
         **kwargs,
     ):
         """
@@ -2140,7 +2141,7 @@ class HiggsAudioModel(HiggsAudioPreTrainedModel, GenerationMixin):
             for param in self.audio_encoder_proj.parameters():
                 param.requires_grad = False
 
-    def freeze_llm(self, freeze_embed=True, freeze_embed_until_idx: Optional[int] = None):
+    def freeze_llm(self, freeze_embed=True, freeze_embed_until_idx: int | None = None):
         for layer in self.layers:
             if isinstance(layer, HiggsAudioDualFFNDecoderLayer):
                 for param in layer.self_attn.parameters():
@@ -2170,7 +2171,7 @@ class HiggsAudioModel(HiggsAudioPreTrainedModel, GenerationMixin):
                     original_embedding=self.embed_tokens, freeze_until_idx=freeze_embed_until_idx
                 )
 
-    def freeze_text_head(self, freeze_text_head_until_idx: Optional[int] = None):
+    def freeze_text_head(self, freeze_text_head_until_idx: int | None = None):
         """Freeze the final text head"""
         if freeze_text_head_until_idx is None:
             for param in self.audio_decoder_proj.text_lm_head.parameters():
@@ -2239,7 +2240,7 @@ class HiggsAudioModel(HiggsAudioPreTrainedModel, GenerationMixin):
             splitted_model.save_pretrained(merged_output_dir, is_main_process=True, state_dict=state_dict)
 
     @torch.inference_mode()
-    def capture_model(self, past_key_values: list[Union[Cache, List[torch.FloatTensor]]]) -> None:
+    def capture_model(self, past_key_values: list[Union[Cache, list[torch.FloatTensor]]]) -> None:
         """Capture CUDA graphs for the model's forward pass with different KV cache lengths.
 
         Args:
