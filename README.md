@@ -1,3 +1,33 @@
+<h1 align="center">GET GOING FAST - GRADIO Version</h1>
+<div align="center" style="display: flex; justify-content: center; margin-top: 10px;">
+  <a href="https://higgs.getgoingfast.pro"><img src='https://www.cognibuild.ai/wp-content/uploads/2024/09/new.webp'🚀style="margin-right: 5px;"></a>
+  <a href="https://higgs.getgoingfast.pro">Download a Quick Installer w/ Gradio Here</a>
+</div>
+<br/>
+<br/>
+<div>
+  Installation instructions: <br>
+  <ol>
+    <li>git clone https://github.com/gjnave/higgs-audio-gradio </li>
+    <li>cd higgs-audio-gradio</li>
+    <li>python -m venv venv</li>
+    <li>call venv\scripts\activate</li>
+    <li>pip install -r requirements.txt</li>
+    <li>If 20/30/40 series pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126</li>
+    <li>If 50 series pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128</li>
+    <li>If AMD/CUDA  pip install torch torchvision torchaudio</li>
+    <li>pip install -e.</li>  
+  </ol>
+</div>
+<div>To Run:
+   <ol>
+      <li>cd higgs-audio-gradio</li>
+      <li>call venv\scripts\activate</li>
+      <li>python run-higgs.py </li>
+   </ol>
+</div>
+  
+<div>*******************************************************</div>
 <h1 align="center">Higgs Audio V2: Redefining Expressiveness in Audio Generation</h1>
 
 <div align="center" style="display: flex; justify-content: center; margin-top: 10px;">
